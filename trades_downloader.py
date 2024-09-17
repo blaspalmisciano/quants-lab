@@ -1,15 +1,14 @@
-import os
-import sys
 import pandas as pd
 import asyncio
+from decimal import Decimal
+import logging
 
-# root_path = os.path.abspath(os.path.join(os.getcwd(), '../..'))
-# sys.path.append(root_path)
+from aiohttp import ClientResponseError
+
+logging.basicConfig(filename='error.log', level=logging.ERROR)
 
 import time
 from core.data_sources import CLOBDataSource
-from core.data_structures.candles import Candles
-from research_notebooks.xtreet_bb.utils import read_yaml_to_dict
 from core.data_sources.trades_feed.connectors.binance_perpetual import BinancePerpetualTradesFeed
 
 class BinancePerpetualTradesFeedFallismo(BinancePerpetualTradesFeed):
@@ -41,7 +40,10 @@ class BinancePerpetualTradesFeedFallismo(BinancePerpetualTradesFeed):
 
             df = pd.DataFrame(all_trades)
             df.rename(columns={"T": "timestamp", "p": "price", "q": "volume", "m": "sell_taker", "a": "id"}, inplace=True)
-            df.drop(columns=["f", "l"], inplace=True)
+            try:
+                df.drop(columns=["f", "l"], inplace=True)
+            except:
+                pass
             df["timestamp"] = df["timestamp"] / 1000
             df.index = pd.to_datetime(df["timestamp"], unit="s")
             df["price"] = df["price"].astype(float)
@@ -52,35 +54,46 @@ async def main():
     clob = CLOBDataSource()
     fallismo = BinancePerpetualTradesFeedFallismo()
 
-    # base_path = os.path.join(root_path, "research_notebooks", "xtreet_bb", "configs")
-    trading_pairs = ["TURBO-USDT"]
-    # for config_path in os.listdir(base_path):
-    #     if config_path != ".gitignore":
-    #         config_dict = read_yaml_to_dict(os.path.join(base_path, config_path))
-    #         trading_pairs.append(config_dict["trading_pair"])
-    # trading_pairs = list(set(trading_pairs))
-    # trading_pairs = [trading_pair for trading_pair in trading_pairs if trading_pair not in ["BANANA-USDT"]]
-    DAYS_TO_DOWNLOAD = 7
+    trading_rules = await clob.get_trading_rules("binance_perpetual")
+    trading_pairs = trading_rules.filter_by_quote_asset("USDT") \
+        .filter_by_min_notional_size(Decimal(str(10))) \
+        .get_all_trading_pairs()
+    trading_pairs = ["CULO-USDT"]
+    DAYS_TO_DOWNLOAD = 1
     candles_dict = {}
     i = 0
     for trading_pair in trading_pairs:
         i += 1
         print(f"Fetching trades for {trading_pair} [{i} from {len(trading_pairs)}]")
-        # base = pd.read_csv(f"data/candles/candles/binance_perpetual|{trading_pair}|1s.csv")
-        # first_trade_id = base['first_trade_id'].max()
-        base = pd.DataFrame()
-        first_trade_id = 18681112
-        print(f"EL ID ES {first_trade_id}")
-        # base = base[base['first_trade_id'] < first_trade_id]
-        trades = await fallismo._get_historical_trades(trading_pair, from_id=first_trade_id)
-        pandas_interval = clob.convert_interval_to_pandas_freq("1s")
-        candles_df = trades.resample(pandas_interval).agg({"price": "ohlc", "volume": "sum", 'id':'first'}).ffill()
-        candles_df.columns = candles_df.columns.droplevel(0)
-        candles_df.rename(columns = {'id':'first_trade_id'}, inplace = True)
-        candles_df["timestamp"] = pd.to_numeric(candles_df.index) // 1e9
+        try:
+            base = pd.read_csv(f"data/candles/candles/binance_perpetual|{trading_pair}|1s.csv")
+            first_trade_id = base['first_trade_id'].max()
+            base = base[base['first_trade_id'] < first_trade_id]
+            trades = await fallismo._get_historical_trades(trading_pair, from_id=first_trade_id)
+            pandas_interval = clob.convert_interval_to_pandas_freq("1s")
+            candles_df = trades.resample(pandas_interval).agg(
+                {"price": "ohlc", "volume": "sum", 'id': 'first'}).ffill()
+            candles_df.columns = candles_df.columns.droplevel(0)
+            candles_df.rename(columns={'id': 'first_trade_id'}, inplace=True)
+            candles_df["timestamp"] = pd.to_numeric(candles_df.index) // 1e9
+            candles_df = pd.concat([base, candles_df])
+            candles_df.to_csv(f"data/candles/candles/binance_perpetual|{trading_pair}|1s.csv", index = False)
 
-        # clob.dump_candles_cache(os.path.join(root_path, "data", "candles"))
-        candles_df.to_csv(f"data/candles/candles/binance_perpetual|{trading_pair}|1s_trades.csv")
+        except FileNotFoundError:
+            print(f"Archivo no encontrado: data/candles/candles/binance_perpetual|{trading_pair}|1s.csv")
+            try:
+                trades = await clob.get_candles_last_days(connector_name = "binance_perpetual", trading_pair = trading_pair, interval = "1s", days = DAYS_TO_DOWNLOAD, from_trades = True)
+                trades.data.to_csv(f"data/candles/candles/binance_perpetual|{trading_pair}|1s.csv", index = False)
+            except ClientResponseError as ce:
+                logging.exception(f"ClientResponseError for trading pair {trading_pair}:\n {ce}")
+                print(ce)
+                continue
+            continue
+
+        except Exception as e:
+            print(e)
+            logging.exception(f"An error occurred during the data load for trading pair {trading_pair}:\n {e}")
+            continue
 
 if __name__ == "__main__":
     asyncio.run(main())
